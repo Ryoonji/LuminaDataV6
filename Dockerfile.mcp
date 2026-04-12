@@ -1,0 +1,20 @@
+# Dockerfile.mcp — LuminaData MCP Server
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl libpq-dev gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+COPY requirements_mcp.txt .
+RUN pip install --no-cache-dir -r requirements_mcp.txt
+
+# Application files
+COPY mcp_server.py .
+
+EXPOSE 8765
+
+CMD ["python", "-m", "uvicorn", "mcp_server:app", "--host", "0.0.0.0", "--port", "8765", "--workers", "2"]

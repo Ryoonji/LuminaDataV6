@@ -1,0 +1,68 @@
+# ============================================================
+# LuminaData Enterprise v6.0 — Docker Compose
+# Services: postgres | mcp_server
+# ============================================================
+#
+# DBeaver:      localhost:5433
+# Streamlit UI: http://localhost:8501  (run locally)
+# MCP Server:   http://localhost:8765
+# ============================================================
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: luminadata_postgres
+    environment:
+      POSTGRES_DB:       luminadata
+      POSTGRES_USER:     lumina_user
+      POSTGRES_PASSWORD: lumina_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumina_user -d luminadata"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lumina_net
+
+  # ── MCP Server ─────────────────────────────────────────────
+  mcp_server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: luminadata_mcp
+    environment:
+      DB_HOST:     postgres
+      DB_PORT:     "5432"
+      DB_NAME:     luminadata
+      DB_USER:     lumina_user
+      DB_PASSWORD: lumina_pass
+      MCP_SECRET:  "${MCP_SECRET:-lumina_mcp_secret_2024}"
+    ports:
+      - "8765:8765"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8765/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lumina_net
+    restart: unless-stopped
+
+# ── Networks ───────────────────────────────────────────────────
+networks:
+  lumina_net:
+    driver: bridge
+
+# ── Volumes ────────────────────────────────────────────────────
+volumes:
+  postgres_data:
