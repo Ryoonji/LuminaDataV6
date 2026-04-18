@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 LuminaData Enterprise v6.0
-AI-Powered Citizen Data Quality — Agentic Edition
+AI-Powered Citizen Data Guardian — Agentic Edition
 
 Architecture:
   • LangGraph Master Orchestrator routes to specialised agents
@@ -13,7 +13,7 @@ Architecture:
 
 from __future__ import annotations
 
-import os, hashlib, time
+import os, hashlib, time, io, json
 from datetime import datetime
 
 import streamlit as st
@@ -290,6 +290,8 @@ def init_session():
         "dq_cache":      None,
         "dq_cache_ts":   0.0,
         "mcp_ok":        None,
+        "applied_fixes":  [],
+        "pending_edit":   None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -836,14 +838,16 @@ if submit and user_input.strip():
             # Update user message intent label
             st.session_state.chat_history[-1]["intent"] = intent
 
+            rag_sources = result.get("rag_sources", None)
             # Add AI response
             st.session_state.chat_history.append({
-                "role":     "assistant",
-                "content":  response,
-                "ts":       datetime.now().strftime("%H:%M"),
-                "intent":   intent,
-                "thoughts": thoughts,
-                "sql":      sql,
+                "role":        "assistant",
+                "content":     response,
+                "ts":          datetime.now().strftime("%H:%M"),
+                "intent":      intent,
+                "thoughts":    thoughts,
+                "sql":         sql,
+                "rag_sources": rag_sources,
             })
 
             # Refresh DQ cache if compliance audit was run
@@ -1202,4 +1206,3 @@ if dims:
                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-

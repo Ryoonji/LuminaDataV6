@@ -34,12 +34,13 @@ _HEADERS = {
 
 # ── Route map  (tool_name → (method, path)) ──────────────────────────────────
 _ROUTES: dict[str, tuple[str, str]] = {
-    "execute_sql_query":         ("POST", "/tools/execute_sql_query"),
-    "execute_write_sql":         ("POST", "/tools/execute_write_sql"),
-    "get_table_schema":          ("POST", "/tools/get_table_schema"),
-    "list_public_tables":        ("GET",  "/tools/list_public_tables"),
-    "query_NDMO_knowledge_base":("POST", "/tools/query_NDMO_knowledge_base"),
-    "get_dq_summary":            ("GET",  "/tools/get_dq_summary"),
+    "execute_sql_query":          ("POST", "/tools/execute_sql_query"),
+    "execute_write_sql":          ("POST", "/tools/execute_write_sql"),
+    "insert_audit_log":           ("POST", "/tools/insert_audit_log"),
+    "get_table_schema":           ("POST", "/tools/get_table_schema"),
+    "list_public_tables":         ("GET",  "/tools/list_public_tables"),
+    "query_NDMO_knowledge_base":  ("POST", "/tools/query_NDMO_knowledge_base"),
+    "get_dq_summary":             ("GET",  "/tools/get_dq_summary"),
 }
 
 
@@ -108,9 +109,44 @@ def sql_query(sql: str, params: dict | None = None) -> list[dict]:
     return result.get("rows", [])
 
 
-def write_sql(sql: str) -> dict:
-    """Execute an approved write SQL correction."""
-    return call_tool("execute_write_sql", {"sql": sql})
+def write_sql(
+    sql:            str,
+    username:       str = "admin",
+    user_role:      str = "Admin",
+    agent_name:     str = "DQ_Agent",
+    action_type:    str = "AUTO_FIX_APPLIED",
+    original_issue: str = "",
+) -> dict:
+    """Execute an approved write SQL correction and log to audit_logs."""
+    return call_tool("execute_write_sql", {
+        "sql":            sql,
+        "username":       username,
+        "user_role":      user_role,
+        "agent_name":     agent_name,
+        "action_type":    action_type,
+        "original_issue": original_issue,
+    })
+
+
+def insert_audit_log(
+    username:       str,
+    action_type:    str,
+    original_issue: str,
+    executed_sql:   str = "",
+    user_role:      str = "Admin",
+    agent_name:     str = "System",
+    mcp_tool_used:  str = "",
+) -> dict:
+    """Insert a row into audit_logs for non-write agent events."""
+    return call_tool("insert_audit_log", {
+        "username":       username,
+        "user_role":      user_role,
+        "agent_name":     agent_name,
+        "action_type":    action_type,
+        "original_issue": original_issue,
+        "executed_sql":   executed_sql,
+        "mcp_tool_used":  mcp_tool_used,
+    })
 
 
 def table_schema(table_name: str) -> list[dict]:
@@ -125,13 +161,11 @@ def list_tables() -> list[str]:
     return result.get("tables", [])
 
 
-
 def NDMO_search(query: str, num_results: int = 5) -> list[dict]:
     """
     Search the NDMO knowledge base via pgvector RAG.
-    Embeds the query locally using sentence-transformers (runs in app venv),
-    then passes the vector to MCP for cosine similarity search.
-    Falls back to static NDMO articles if embedding unavailable.
+    Embeds query locally, passes vector to MCP for cosine similarity search.
+    Falls back to static NDMO articles if sentence-transformers unavailable.
     """
     embedding = None
     try:
@@ -139,7 +173,7 @@ def NDMO_search(query: str, num_results: int = 5) -> list[dict]:
         model     = SentenceTransformer("all-MiniLM-L6-v2")
         embedding = model.encode(query).tolist()
     except Exception:
-        pass  # MCP will use static fallback
+        pass
 
     result = call_tool(
         "query_NDMO_knowledge_base",

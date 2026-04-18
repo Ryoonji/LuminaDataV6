@@ -19,7 +19,7 @@ mcp_client.call_tool().  No agent imports sqlalchemy or psycopg2.
 from __future__ import annotations
 
 import os, json, logging
-from typing import TypedDict, Literal, Any
+from typing import TypedDict, Literal, Annotated, Any
 
 # LangGraph
 from langgraph.graph import StateGraph, END
@@ -30,7 +30,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from mcp_client import (
     sql_query, write_sql, table_schema, list_tables,
-    NDMO_search, dq_summary, MCPError,
+    NDMO_search, dq_summary, insert_audit_log, MCPError,
 )
 from dotenv import load_dotenv
 
@@ -67,6 +67,7 @@ class AgentState(TypedDict):
     response:     str
     sql_executed: str | None
     dq_report:    dict[str, Any] | None
+    rag_sources:  list[dict] | None   # RAG chunks returned by NDMO_search
     error:        str | None
 
 
@@ -79,10 +80,26 @@ def _add_thought(state: AgentState, thought: str) -> None:
 # ── Node 1: Master Orchestrator ───────────────────────────────────────────────
 def orchestrator_node(state: AgentState) -> AgentState:
     """
-    Classifies user intent into SQL_QUERY | NDMO_COMPLIANCE_CHECK | GENERAL_INFO.
-    Uses an LLM with a tight structured prompt.
+    Classifies user intent into SQL_QUERY | NDMO_COMPLIANCE_CHECK | GENERAL_INFO | PDF_QUERY.
+    PDF_QUERY is triggered when the user asks what the ingested PDF says about a topic.
     """
     _add_thought(state, "🧠 Orchestrator received message — classifying intent...")
+
+    # ── Fast-path: PDF self-test query ────────────────────────────────────────
+    msg_lower = state["user_message"].lower()
+    pdf_triggers = [
+        "what does the ingested pdf say",
+        "what does the pdf say",
+        "what does the document say",
+        "what does the policy say",
+        "according to the pdf",
+        "from the pdf",
+        "in the pdf",
+    ]
+    if any(t in msg_lower for t in pdf_triggers):
+        state["intent"] = "PDF_QUERY"
+        _add_thought(state, "📄 PDF self-test query detected — routing directly to RAG Auditor")
+        return state
 
     llm = _make_llm(temperature=0.0)
     prompt = SystemMessage(content="""You are the Master Orchestrator for LuminaData, an AI data-quality platform.
@@ -98,7 +115,6 @@ No other text.""")
     try:
         resp = llm.invoke([prompt, HumanMessage(content=state["user_message"])])
         raw  = resp.content.strip()
-        # Strip markdown fences if model wraps them
         raw  = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
         intent = data.get("intent", "GENERAL_INFO").upper()
@@ -255,9 +271,11 @@ def dq_agent(state: AgentState) -> AgentState:
         )
         source_label = "pgvector RAG" if regulations and regulations[0].get("source") == "pgvector_rag" else "NDMO static fallback"
         _add_thought(state, f"📖 Retrieved {len(regulations)} regulation(s) from {source_label}")
+        state["rag_sources"] = regulations
     except MCPError as exc:
         _add_thought(state, f"⚠️ RAG unavailable: {exc.detail} — using built-in rules")
         reg_text = "NDMO regulations unavailable. Rely on built-in DQ rules."
+        state["rag_sources"] = []
 
     # Step 4: LLM compliance report
     _add_thought(state, "🤖 DQ Agent generating compliance report via LLM...")
@@ -307,7 +325,63 @@ Dimensions Detail:
     return state
 
 
-# ── Node 4: General Info Agent ────────────────────────────────────────────────
+# ── Node 5: PDF Query Agent ───────────────────────────────────────────────────
+def pdf_query_agent(state: AgentState) -> AgentState:
+    """
+    Handles 'What does the ingested PDF say about X?' queries.
+    Prioritises NDMO_search and prefixes the answer with
+    [Verified from Policy Document] when pgvector results are found.
+    """
+    _add_thought(state, "📄 PDF Query Agent activated — searching ingested documents...")
+
+    try:
+        results = NDMO_search(state["user_message"], num_results=8)
+        state["rag_sources"] = results
+    except MCPError as exc:
+        state["rag_sources"] = []
+        state["response"]    = f"❌ RAG search failed: {exc.detail}"
+        return state
+
+    from_pdf = [r for r in results if r.get("source") == "pgvector_rag"]
+
+    if not from_pdf:
+        state["response"] = (
+            "No relevant content found in the ingested PDF documents for that topic.\n\n"
+            "Make sure you have uploaded an NDMO PDF via the sidebar, then try again."
+        )
+        _add_thought(state, "⚠️ No pgvector results — no PDFs ingested yet")
+        return state
+
+    _add_thought(state, f"✅ Found {len(from_pdf)} chunk(s) from uploaded PDF(s)")
+
+    context = "\n\n".join(
+        f"[{r['title']}  |  score: {r['score']:.2f}]\n{r['content']}"
+        for r in from_pdf
+    )
+
+    llm = _make_llm(temperature=0.1)
+    sys_prompt = SystemMessage(content=f"""You are the LuminaData Policy Document Agent.
+The user wants to know what the ingested NDMO PDF says about a topic.
+Answer ONLY using the retrieved document chunks below.
+Start your response with exactly: [Verified from Policy Document]
+Then answer concisely, quoting or paraphrasing the relevant passages.
+If the chunks do not contain relevant information, say so clearly.
+
+RETRIEVED CHUNKS:
+{context}""")
+
+    try:
+        resp = llm.invoke([sys_prompt, HumanMessage(content=state["user_message"])])
+        state["response"] = resp.content
+        _add_thought(state, "✅ PDF query answer ready")
+    except Exception as exc:
+        state["error"]    = str(exc)
+        state["response"] = f"❌ LLM error: {exc}"
+
+    return state
+
+
+# ── Node 6: General Info Agent ────────────────────────────────────────────────
 def general_agent(state: AgentState) -> AgentState:
     """
     Handles general questions about the platform, features, and navigation.
@@ -349,9 +423,10 @@ Be brief and helpful. Use bullet points sparingly.""")
 def route_intent(state: AgentState) -> str:
     intent = state.get("intent", "GENERAL_INFO")
     routes = {
-        "SQL_QUERY":              "sql_agent",
+        "SQL_QUERY":             "sql_agent",
         "NDMO_COMPLIANCE_CHECK": "dq_agent",
-        "GENERAL_INFO":           "general_agent",
+        "PDF_QUERY":             "pdf_query_agent",
+        "GENERAL_INFO":          "general_agent",
     }
     return routes.get(intent, "general_agent")
 
@@ -362,25 +437,27 @@ def build_graph() -> Any:
     graph = StateGraph(AgentState)
 
     # Nodes
-    graph.add_node("orchestrator", orchestrator_node)
-    graph.add_node("sql_agent",    sql_agent)
-    graph.add_node("dq_agent",     dq_agent)
-    graph.add_node("general_agent",general_agent)
+    graph.add_node("orchestrator",    orchestrator_node)
+    graph.add_node("sql_agent",       sql_agent)
+    graph.add_node("dq_agent",        dq_agent)
+    graph.add_node("pdf_query_agent", pdf_query_agent)
+    graph.add_node("general_agent",   general_agent)
 
-    # Edges
     graph.set_entry_point("orchestrator")
     graph.add_conditional_edges(
         "orchestrator",
         route_intent,
         {
-            "sql_agent":     "sql_agent",
-            "dq_agent":      "dq_agent",
-            "general_agent": "general_agent",
+            "sql_agent":       "sql_agent",
+            "dq_agent":        "dq_agent",
+            "pdf_query_agent": "pdf_query_agent",
+            "general_agent":   "general_agent",
         },
     )
-    graph.add_edge("sql_agent",     END)
-    graph.add_edge("dq_agent",      END)
-    graph.add_edge("general_agent", END)
+    graph.add_edge("sql_agent",       END)
+    graph.add_edge("dq_agent",        END)
+    graph.add_edge("pdf_query_agent", END)
+    graph.add_edge("general_agent",   END)
 
     return graph.compile()
 
@@ -413,6 +490,7 @@ def run_agent(
         "response":     "",
         "sql_executed": None,
         "dq_report":    None,
+        "rag_sources":  None,
         "error":        None,
     }
 

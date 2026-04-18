@@ -53,6 +53,20 @@ _ALLOWED_WRITE_PATTERNS = [
     r"^\s*UPDATE\s+citizens\s+SET\s+.+WHERE\s+id\s*=\s*\d+",
 ]
 
+# ── Lazy embedding model (loaded once on first RAG query) ─────────────────────
+_embed_model = None
+
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+            logger.info("Embedding model loaded: all-MiniLM-L6-v2")
+        except Exception as exc:
+            logger.warning("sentence-transformers unavailable: %s", exc)
+    return _embed_model
+
 
 # ── DB Engine ─────────────────────────────────────────────────────────────────
 _engine: sa.engine.Engine | None = None
@@ -113,15 +127,20 @@ class SqlRequest(BaseModel):
 class WriteRequest(BaseModel):
     sql: str
 
+class WriteWithAuditRequest(BaseModel):
+    sql:            str
+    username:       str = "admin"
+    user_role:      str = "Admin"
+    agent_name:     str = "DQ_Agent"
+    action_type:    str = "AUTO_FIX_APPLIED"
+    original_issue: str = ""
+
 class SchemaRequest(BaseModel):
     table_name: str
 
 class RagRequest(BaseModel):
     query:       str
-    num_results: int              = Field(default=5, ge=1, le=20)
-    embedding:   list[float] | None = Field(default=None,
-        description="Pre-computed query embedding from app.py. "
-                    "If None, falls back to static NDMO articles.")
+    num_results: int = Field(default=5, ge=1, le=20)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -153,17 +172,78 @@ def execute_sql_query(req: SqlRequest):
 
 # ── Tool: execute_write_sql ───────────────────────────────────────────────────
 @app.post("/tools/execute_write_sql", dependencies=[Depends(verify_token)])
-def execute_write_sql(req: WriteRequest):
-    """Write SQL for approved corrections only (UPDATE citizens WHERE id=N)."""
+def execute_write_sql(req: WriteWithAuditRequest):
+    """
+    Write SQL for approved corrections only (UPDATE citizens WHERE id=N).
+    Automatically logs the action to audit_logs table after success.
+    """
     clean   = req.sql.strip()
     allowed = any(re.match(p, clean, re.I | re.S) for p in _ALLOWED_WRITE_PATTERNS)
     if not allowed:
         raise HTTPException(status_code=403,
             detail="Only approved UPDATE corrections on citizens are permitted.")
     try:
-        return _run_write_sql(clean)
+        result = _run_write_sql(clean)
+        # ── Write audit log entry ──────────────────────────────────────────────
+        try:
+            _run_write_sql(
+                f"INSERT INTO audit_logs "
+                f"(user_name, user_role, agent_name, action_type, original_issue, executed_sql) "
+                f"VALUES ("
+                f"  '{req.username.replace(chr(39), '')}', "
+                f"  '{req.user_role.replace(chr(39), '')}', "
+                f"  '{req.agent_name.replace(chr(39), '')}', "
+                f"  '{req.action_type.replace(chr(39), '')}', "
+                f"  $${req.original_issue.replace('$$','')}$$, "
+                f"  $${clean.replace('$$','')}$$"
+                f")"
+            )
+        except Exception as audit_err:
+            logger.warning("Audit log insert failed (non-fatal): %s", audit_err)
+        return result
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Write SQL error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Tool: insert_audit_log ────────────────────────────────────────────────────
+class AuditLogRequest(BaseModel):
+    username:       str
+    user_role:      str = "Admin"
+    agent_name:     str = "System"
+    action_type:    str
+    original_issue: str
+    executed_sql:   str = ""
+    mcp_tool_used:  str = ""
+
+@app.post("/tools/insert_audit_log", dependencies=[Depends(verify_token)])
+def insert_audit_log(req: AuditLogRequest):
+    """Insert a row into audit_logs directly (for agent-sourced events)."""
+    try:
+        eng = get_engine()
+        with eng.connect() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO audit_logs "
+                    "(user_name, user_role, agent_name, action_type, original_issue, executed_sql, mcp_tool_used) "
+                    "VALUES (:u, :r, :a, :t, :i, :s, :m)"
+                ),
+                {
+                    "u": req.username[:50],
+                    "r": req.user_role[:20],
+                    "a": req.agent_name[:50],
+                    "t": req.action_type[:50],
+                    "i": req.original_issue,
+                    "s": req.executed_sql,
+                    "m": req.mcp_tool_used[:100],
+                }
+            )
+            conn.commit()
+        return {"status": "ok"}
+    except Exception as exc:
+        logger.error("Audit log insert error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -216,13 +296,22 @@ def list_public_tables():
 def query_NDMO_knowledge_base(req: RagRequest):
     """
     RAG search over NDMO/PDPL documents stored in PostgreSQL pgvector.
-    Expects a pre-computed embedding from mcp_client.py (sentence-transformers
-    runs in the local venv, not in this container — keeps Docker image small).
-    Falls back to built-in NDMO articles when embedding is None or table is empty.
+
+    Flow:
+      1. Embed query with all-MiniLM-L6-v2 (local, no API key needed)
+      2. Cosine similarity search against rag_documents table
+      3. Return top-N chunks with source, page, and similarity score
+
+    Falls back to built-in NDMO articles when:
+      - No PDFs have been uploaded yet (rag_documents is empty)
+      - sentence-transformers is not installed
     """
-    if req.embedding is not None:
+    model = _get_embed_model()
+
+    if model is not None:
         try:
-            embedding_str = "[" + ",".join(str(x) for x in req.embedding) + "]"
+            query_embedding = model.encode(req.query).tolist()
+            embedding_str   = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
             rows = _run_read_sql(
                 """
@@ -271,7 +360,7 @@ def _NDMO_static_fallback(query: str) -> dict:
     """
     NDMO_ARTICLES = [
         {
-            "title":   "PDPL Article 5 — Data Accuracy",
+            "title":   "NDMO PDPL Article 5 — Data Accuracy",
             "content": (
                 "Personal data must be accurate and, where necessary, kept up to date. "
                 "Every reasonable step must be taken to ensure that inaccurate personal "
@@ -281,7 +370,7 @@ def _NDMO_static_fallback(query: str) -> dict:
             "score": 0.95,
         },
         {
-            "title":   "NDMO DQ Pillar — Completeness",
+            "title":   "NDMO NDMO DQ Pillar — Completeness",
             "content": (
                 "All mandatory citizen registry fields (National ID, Date of Birth, "
                 "Phone, Email) must be populated. NULL values in mandatory fields "
@@ -290,7 +379,7 @@ def _NDMO_static_fallback(query: str) -> dict:
             "score": 0.92,
         },
         {
-            "title":   "PDPL Article 12 — Data Validity",
+            "title":   "NDMO PDPL Article 12 — Data Validity",
             "content": (
                 "Saudi National IDs must conform to the format: 10 digits beginning "
                 "with '1'. Phone numbers must match 05XXXXXXXX (10 digits, Saudi mobile). "
@@ -299,7 +388,7 @@ def _NDMO_static_fallback(query: str) -> dict:
             "score": 0.90,
         },
         {
-            "title":   "NDMO DQ Pillar — Consistency",
+            "title":   "NDMO NDMO DQ Pillar — Consistency",
             "content": (
                 "City and region fields must be consistent. Riyadh city → Riyadh region; "
                 "Jeddah / Mecca → Makkah region; Dammam / Khobar → Eastern region; "
@@ -308,7 +397,7 @@ def _NDMO_static_fallback(query: str) -> dict:
             "score": 0.88,
         },
         {
-            "title":   "PDPL Article 8 — Timeliness",
+            "title":   "NDMO PDPL Article 8 — Timeliness",
             "content": (
                 "Identity documents must be current. Records with id_expiry_date < "
                 "CURRENT_DATE are a timeliness violation. Documents expiring within "
@@ -317,7 +406,7 @@ def _NDMO_static_fallback(query: str) -> dict:
             "score": 0.85,
         },
         {
-            "title":   "NDMO DQ Pillar — Uniqueness",
+            "title":   "NDMO NDMO DQ Pillar — Uniqueness",
             "content": (
                 "Each citizen must have a unique national_id. Duplicate national IDs "
                 "are a critical uniqueness violation that must be resolved immediately."
